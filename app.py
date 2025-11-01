@@ -16,15 +16,20 @@ from ml.pipelines import (
     extract_numeric_split_thresholds,
 )
 from ml.train import build_tree_pipeline_and_train
+
+# OpenAI API 사용
+from llm.openai_client import (
+    OPENAI_MODEL,
+    is_openai_configured,
+    call_llm_openai,
+)
+# 프롬프트 빌더는 기존 것 재사용(같은 함수명 유지)
 from llm.ollama_client import (
-    OLLAMA_BASE,
-    OLLAMA_MODEL,
-    is_ollama_alive,
-    is_ollama_model_available,
-    call_llm_ollama,
     build_tree_summary_for_llm,
     build_kor_explanation_prompt,
 )
+
+
 
 # ============================
 # 기본 설정
@@ -382,12 +387,12 @@ if st.session_state.page == "분석 해설":
     if not st.session_state.get("trained", False):
         st.warning("먼저 ‘모델 학습’ 페이지에서 학습을 완료해 주세요.")
     else:
-        alive = is_ollama_alive()
-        avail = is_ollama_model_available()
-        if not alive:
-            st.error("Ollama 서버에 연결할 수 없습니다. PowerShell에서 `ollama serve` 또는 서비스 상태를 확인하세요.")
-        elif not avail:
-            st.error(f"Ollama에 모델 '{OLLAMA_MODEL}' 이(가) 없습니다. 콘솔에서 `ollama pull {OLLAMA_MODEL}` 실행 후 새로고침하세요.")
+        if not is_openai_configured():
+            st.error(
+                "OpenAI API 키를 찾지 못했습니다. "
+                "로컬: `.streamlit/secrets.toml` 또는 환경변수 OPENAI_API_KEY 설정\n"
+                "배포: Streamlit Community Cloud의 Settings → Secrets에 키를 추가하세요."
+            )
         else:
             top_n = st.slider("상위 수치형 변수 개수(임계값 시각화)", 3, 12, 6, 1)
 
@@ -405,7 +410,7 @@ if st.session_state.page == "분석 해설":
             if not top_numeric:
                 st.info("중요도가 높은 수치형 피처가 없습니다.")
             else:
-                cols = st.columns(3)  # 3열 배치
+                cols = st.columns(3)
                 for i, f in enumerate(top_numeric):
                     ths = thresholds_map.get(f, [])
                     with cols[i % 3]:
@@ -413,7 +418,7 @@ if st.session_state.page == "분석 해설":
                             plot_numeric_feature_with_thresholds(df_train_sample, f, ths, bins=40)
                         else:
                             st.caption(f"- {f}: 트리 분기 임계값이 없습니다.")
-                st.caption("세로선은 의사결정나무가 실제로 사용한 분기 임계값을 의미합니다. 데이터 분포의 봉우리를 가르는 임계값일수록 영향력이 클 수 있습니다.")
+                st.caption("세로선은 의사결정나무가 실제로 사용한 분기 임계값입니다.")
 
             if st.button("해설 보기"):
                 model = st.session_state.pipe.named_steps["model"]
@@ -434,8 +439,13 @@ if st.session_state.page == "분석 해설":
 
                 prompt = build_kor_explanation_prompt(base_summary)
                 with st.spinner("해설 생성 중…"):
-                    resp = call_llm_ollama(
+                    resp = call_llm_openai(
                         prompt,
-                        options={"temperature": 0.2, "top_p": 0.9, "num_predict": 900},
+                        options={
+                            "model": OPENAI_MODEL,
+                            "temperature": 0.2,
+                            "top_p": 0.9,
+                            "max_tokens": 2000,
+                        },
                     )
                 st.markdown(resp)

@@ -1,4 +1,3 @@
-# ml/pipelines.py
 from __future__ import annotations
 import numpy as np
 import pandas as pd
@@ -9,29 +8,40 @@ from sklearn.preprocessing import OneHotEncoder
 from sklearn.impute import SimpleImputer
 from sklearn.tree import DecisionTreeClassifier, DecisionTreeRegressor
 
+# ------------------------------------------------------------
+# 1) 타스크 유형 자동 판정 (분류/회귀)
+# ------------------------------------------------------------
 def infer_task_type(y: pd.Series, uniq_threshold: int = 20) -> str:
+    """y가 이산(정수/범주형, 고유값 적음)이면 classification, 그 외 regression.
+    - uniq_threshold: 정수형이면서 고유값 수가 임계 이하일 때 분류로 간주
+    """
     y_nonnull = y.dropna()
     if y_nonnull.empty:
         return "classification"
     if not pd.api.types.is_numeric_dtype(y_nonnull):
         return "classification"
     nunique = y_nonnull.nunique()
-    if nunique <= uniq_threshold and np.all(np.floor(y_nonnull.values) == y_nonnull.values):
+    # 정수형 + 고유값이 적으면 분류로 처리
+    if np.all(np.floor(y_nonnull.values) == y_nonnull.values) and nunique <= uniq_threshold:
         return "classification"
     return "regression"
 
+# ------------------------------------------------------------
+# 2) 자동 피처 추천 (결측률/상수/ID성 컬럼 제외)
+# ------------------------------------------------------------
 def auto_feature_recommendations(
     df: pd.DataFrame,
     target_col: str,
-    time_cols: list[str] | None = None,
+    time_cols: List[str] | None = None,
     max_missing_ratio: float = 0.5,
     drop_constant: bool = True,
     drop_id_like: bool = True,
 ) -> Tuple[List[str], Dict[str, str]]:
     time_cols = set(time_cols or [])
     candidates = [c for c in df.columns if c not in set([target_col]) | time_cols | {"__time_dt__", "__row__"}]
-    reasons = {}
-    keep = []
+    reasons: Dict[str, str] = {}
+    keep: List[str] = []
+
     for c in candidates:
         s = df[c]
         miss_ratio = 1.0 - s.notna().mean()
@@ -55,8 +65,19 @@ def auto_feature_recommendations(
         keep.append(c)
     return keep, reasons
 
-def build_tree_pipeline(task: str, numeric_features: list[str], categorical_features: list[str], complexity: int, random_state: int) -> Pipeline:
-    # 복잡도(1~10) → 트리의 깊이/리프에 매핑
+# ------------------------------------------------------------
+# 3) 트리 파이프라인 (분류/회귀 모두 지원)
+# ------------------------------------------------------------
+def build_tree_pipeline(
+    task: str,
+    numeric_features: List[str],
+    categorical_features: List[str],
+    complexity: int,
+    random_state: int,
+) -> Pipeline:
+    """분류/회귀 공용 트리 파이프라인.
+    - complexity(1~10)를 트리의 깊이/leaf 샘플 수에 매핑
+    """
     complexity = int(np.clip(complexity, 1, 10))
     max_depth = int(np.interp(complexity, [1, 10], [3, 30]))
     min_samples_leaf = int(np.round(np.interp(complexity, [1, 10], [20, 1])))
@@ -67,21 +88,23 @@ def build_tree_pipeline(task: str, numeric_features: list[str], categorical_feat
         ("imputer", SimpleImputer(strategy="most_frequent")),
         ("onehot", OneHotEncoder(handle_unknown="ignore")),
     ])
+
     preproc = ColumnTransformer([
         ("num", num_pipe, numeric_features),
         ("cat", cat_pipe, categorical_features),
     ])
 
-    if task == "classification":
-        model = DecisionTreeClassifier(
-            criterion="gini",
+    task = (task or "classification").lower()
+    if task == "regression":
+        model = DecisionTreeRegressor(
+            criterion="squared_error",
             max_depth=max_depth,
             min_samples_leaf=min_samples_leaf,
             random_state=random_state,
         )
     else:
-        model = DecisionTreeRegressor(
-            criterion="squared_error",
+        model = DecisionTreeClassifier(
+            criterion="gini",
             max_depth=max_depth,
             min_samples_leaf=min_samples_leaf,
             random_state=random_state,
@@ -89,27 +112,39 @@ def build_tree_pipeline(task: str, numeric_features: list[str], categorical_feat
 
     return Pipeline([("preprocess", preproc), ("model", model)])
 
-def get_feature_names_from_preprocessor(preproc: ColumnTransformer) -> list[str]:
-    names: list[str] = []
+# ------------------------------------------------------------
+# 4) 전처리 후 피처 이름 추출 (OHE 컬럼명 포함)
+# ------------------------------------------------------------
+def get_feature_names_from_preprocessor(preproc: ColumnTransformer) -> List[str]:
+    names: List[str] = []
     for name, trans, cols in preproc.transformers_:
         if name == "remainder" and trans == "drop":
             continue
+        # ColumnTransformer 내부에 Pipeline(onehot 등)이 들어간 경우 처리
         if hasattr(trans, "get_feature_names_out"):
             try:
                 fn = trans.get_feature_names_out(cols)
-                names.extend(fn)
+                names.extend(list(fn))
+                continue
             except Exception:
-                names.extend(list(cols))
-        elif hasattr(trans, "_final_estimator") and hasattr(trans._final_estimator, "get_feature_names_out"):
-            fn = trans._final_estimator.get_feature_names_out(cols)
-            names.extend(fn)
-        else:
-            names.extend(list(cols))
+                pass
+        if hasattr(trans, "_final_estimator") and hasattr(trans._final_estimator, "get_feature_names_out"):
+            try:
+                fn = trans._final_estimator.get_feature_names_out(cols)
+                names.extend(list(fn))
+                continue
+            except Exception:
+                pass
+        # fallback
+        names.extend(list(cols))
     return list(names)
 
-def extract_numeric_split_thresholds(model, feature_names: list[str], numeric_feature_names: list[str]) -> dict:
+# ------------------------------------------------------------
+# 5) 트리에서 수치형 스플릿 임계값 추출
+# ------------------------------------------------------------
+def extract_numeric_split_thresholds(model, feature_names: List[str], numeric_feature_names: List[str]) -> Dict[str, List[float]]:
     """트리에서 수치형 피처의 분기 임계값을 추출하여 {feature: sorted unique thresholds} 반환"""
-    thresholds_by_feat = {f: [] for f in numeric_feature_names}
+    thresholds_by_feat: Dict[str, List[float]] = {f: [] for f in numeric_feature_names}
     if not hasattr(model, "tree_"):
         return thresholds_by_feat
     t = model.tree_
